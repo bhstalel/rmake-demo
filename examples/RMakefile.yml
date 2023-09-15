@@ -1,6 +1,6 @@
 CC: gcc
 CFLAGS: -Iinclude
-LDFLAGS: -l:hello.so -L/home/talel/Documents/SelfWork/pymake-demo/examples
+LDFLAGS: -l:hello.so -L$(shell pwd)
 EXEC: main
 LIB: hello.so
 
