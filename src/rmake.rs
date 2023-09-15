@@ -1,9 +1,7 @@
 /// This represents the rmake utilities
 pub mod rmake {
     use crate::RMakeError;
-    use regex::Regex;
     use serde_yaml::{Mapping, Value};
-    use std::process::Command;
     use std::{collections::HashMap, vec};
     use tracing::{debug, error, info};
 
@@ -151,38 +149,42 @@ pub mod rmake {
         /// * path - The RMakefile.yml path
         ///
         /// Returns a Result Self object
-        pub fn new(path: String) -> Result<RMake, ()> {
-            if let Ok(yml_c) = RMake::load_yml(path) {
-                /* Content MUST be Mapping */
-                if !yml_c.is_mapping() {
-                    panic!("The Yml file should be Mapping, check the format!");
+        pub fn new(path: String) -> Result<RMake, String> {
+            match RMake::load_yml(path) {
+                Ok(yml_c) => {
+                    /* Content MUST be Mapping */
+                    if !yml_c.is_mapping() {
+                        return Err(String::from(
+                            "The Yml file should be Mapping, check the format!",
+                        ));
+                    }
+
+                    /* We are sure that this is Mapping, so unwrap is safe here !*/
+                    let mapping = yml_c.as_mapping().unwrap();
+
+                    /* Extract all Mappings and Variables */
+                    let (targets, variables) = RMake::extract_targets_and_variables(mapping);
+
+                    if targets.is_none() {
+                        return Err(String::from("No target is defined in the input file!"));
+                    }
+
+                    let mut targets = targets.unwrap();
+
+                    /* Expand commands */
+                    for (name, mut target_obj) in targets.clone().into_iter() {
+                        target_obj.expand_commands(&variables);
+                        *targets.get_mut(&name).unwrap() = target_obj.clone();
+                    }
+
+                    return Ok(RMake {
+                        targets: targets,
+                        variables: variables,
+                    });
                 }
 
-                /* We are sure that this is Mapping, so unwrap is safe here !*/
-                let mapping = yml_c.as_mapping().unwrap();
-
-                /* Extract all Mappings and Variables */
-                let (targets, variables) = RMake::extract_targets_and_variables(mapping);
-
-                if targets.is_none() {
-                    panic!("No target is defined in the input file!");
-                }
-
-                let mut targets = targets.unwrap();
-
-                /* Expand commands */
-                for (name, mut target_obj) in targets.clone().into_iter() {
-                    target_obj.expand_commands(&variables);
-                    *targets.get_mut(&name).unwrap() = target_obj.clone();
-                }
-
-                return Ok(RMake {
-                    targets: targets,
-                    variables: variables,
-                });
+                Err(e) => Err(format!("{}", e)),
             }
-
-            Err(())
         }
 
         /// Load YAML content from a given file
@@ -260,18 +262,37 @@ pub mod rmake {
             command_chain
         }
 
+        pub fn get_first(&self, name: Option<String>) -> Option<&RMakeTarget> {
+            match name {
+                Some(target_name) => self.targets.get(&target_name),
+                None => match self.targets.keys().next() {
+                    /* Return first target */
+                    Some(key) => self.targets.get(key),
+                    None => {
+                        RMakeError!("Error getting first target!");
+                    }
+                },
+            }
+        }
+
         /// Run the RMake system
         ///
         /// # Arguments:
         ///
         /// * name - The target name
-        pub fn run(&mut self, name: String) {
-            if let Some(main_target) = self.targets.get(&name) {
+        pub fn run(&mut self, name: Option<String>) {
+            let first_target = self.get_first(name.clone());
+            if let Some(main_target) = first_target {
                 for cmd in self.chain_commands(main_target.clone()) {
                     info!("Running: {}", cmd);
+                    let split_cmd = cmd.split_whitespace().collect::<Vec<_>>();
+                    std::process::Command::new(split_cmd[0])
+                        .args(&split_cmd[1..])
+                        .status()
+                        .expect(format!("Cannot run command: {}", cmd).as_str());
                 }
             } else {
-                RMakeError!("No rule to make target: {}", name);
+                RMakeError!("No rule to make target: {}", name.unwrap());
             }
         }
     }
@@ -380,12 +401,13 @@ pub mod rmake {
         fn expand_commands(&mut self, variables: &Option<RMakeVariables>) {
             let mut final_commands = vec![];
             for command in self.cmds.clone().into_iter() {
-                debug!("Expanding command: {}", command);
-                let cmd = RMakeUtils::find_and_replace(
-                    command,
-                    RMakeUtils::default_rmake_regex(),
-                    variables,
-                );
+                debug!("Expanding command variable: ({})", command);
+
+                let cmd = crate::RMakeExpandCommand!(self, command, variables, var);
+                let cmd = crate::RMakeExpandCommand!(self, cmd, variables, target_name);
+                let cmd = crate::RMakeExpandCommand!(self, cmd, variables, dep_all);
+                let cmd = crate::RMakeExpandCommand!(self, cmd, variables, dep_first);
+
                 final_commands.push(cmd.clone());
                 debug!(" --------------- \n");
             }
@@ -398,14 +420,46 @@ pub mod rmake {
 
         use super::{RMakeCoreCommand, RMakeVariables};
         use crate::RMakeError;
+        //use paste::paste;
         use regex::Regex;
         use std::process::Command;
         use std::str::FromStr;
         use tracing::{debug, error, warn};
-        use tracing_subscriber::field::debug;
 
-        pub fn default_rmake_regex() -> Regex {
-            Regex::new(r"\$\(([^)]+)\)").unwrap()
+        #[macro_export]
+        macro_rules! RMakeExpandCommand {
+            ($self:ident, $command:ident, $variables:ident, $re:expr) => {
+                paste::paste! {
+                    RMakeUtils::find_and_replace(
+                        $command.clone(),
+                        RMakeUtils::[<rmake_re_ $re>](),
+                        $variables,
+                        &$self.name,
+                        &$self.deps
+                    )
+                }
+            };
+        }
+
+        const RMAKE_RE_VARIABLE: &str = r"\$\(([^)]+)\)";
+        const RMAKE_RE_TARGET_NAME: &str = r"\$@";
+        const RMAKE_RE_DEP_ALL: &str = r"\$^";
+        const RMAKE_RE_DEP_FIRST: &str = r"\$<";
+
+        pub fn rmake_re_var() -> Regex {
+            Regex::new(RMAKE_RE_VARIABLE).unwrap()
+        }
+
+        pub fn rmake_re_target_name() -> Regex {
+            Regex::new(RMAKE_RE_TARGET_NAME).unwrap()
+        }
+
+        pub fn rmake_re_dep_all() -> Regex {
+            Regex::new(RMAKE_RE_DEP_ALL).unwrap()
+        }
+
+        pub fn rmake_re_dep_first() -> Regex {
+            Regex::new(RMAKE_RE_DEP_FIRST).unwrap()
         }
 
         /// Find a regex and replace it in all the given String
@@ -421,81 +475,106 @@ pub mod rmake {
             value: String,
             re: regex::Regex,
             variables: &Option<RMakeVariables>,
+            target_name: &String,
+            target_deps: &Option<Vec<String>>,
         ) -> String {
             let mut value = value;
+            debug!("[find_and_replace] Looking for {:?} in {} ..", re, value);
             for found in re.find_iter(&value.clone()) {
                 /* If variable does not exist, ignoring by default */
                 let mut to = String::from("");
 
                 /* Get variable value and then expand */
                 let found_str = found.as_str();
-                let found_str = &found_str[2..found_str.len() - 1];
-                let found_str_elems = found_str.split_whitespace().collect::<Vec<_>>();
+                debug!("Found match: {}", found_str);
 
-                debug!(
-                    "Found match: {} with elems: {:?}",
-                    found_str, found_str_elems
-                );
-
-                if found_str_elems.len() == 1 {
-                    /* A local variable, check if exist, else, check if it is env variable */
-                    let mut check_env = true;
-                    if let Some(vars) = variables {
-                        if let Some(value) = vars.get(found_str_elems[0]) {
-                            /* Expand the variable */
-                            debug!(
-                                "Expanding variable {} with value: {}",
-                                value.name, value.value
-                            );
-                            to = find_and_replace(
-                                value.value.clone(),
-                                default_rmake_regex(),
-                                variables,
-                            );
-                            debug!("Expanded variable: {}", to);
-                            check_env = false;
-                        } else {
-                            warn!(
-                                "Variable {} is not found in variables, checking env ..",
-                                found_str_elems[0]
-                            );
+                /* Check if special or not */
+                match found_str {
+                    "$@" => to = target_name.clone(),
+                    "$^" => {
+                        if target_deps.is_none() {
+                            warn!("Using $^ without providing any deps ! Ignoring ..");
                         }
-                    };
-
-                    if check_env {
-                        if let Ok(env_val) = std::env::var(found_str_elems[0]) {
-                            to = env_val;
-                            debug!("Found variable value in env: {}", to);
-                        }
+                        to = target_deps.clone().unwrap().join(" ");
                     }
-                } else if found_str_elems.len() > 1 {
-                    debug!("Variable has more than element, cheking RMakeCoreCommands ..");
+                    "$<" => {
+                        if target_deps.is_none() {
+                            warn!("Using $< without providing any deps ! Ignoring ..");
+                        }
+                        to = target_deps.clone().unwrap().get(0).unwrap().clone();
+                    }
+                    &_ => {
+                        let found_str = &found_str[2..found_str.len() - 1];
+                        let found_str_elems = found_str.split_whitespace().collect::<Vec<_>>();
 
-                    /* This is an RMakeCoreCommand */
-                    match RMakeCoreCommand::from_str(found_str_elems[0]) {
-                        Ok(core_cmd) => match core_cmd {
-                            RMakeCoreCommand::Shell => {
-                                /* Run a Shell command and set (to) */
-                                let mut shell_command = Command::new(found_str_elems[1]);
+                        debug!(
+                            "Found match: {} with elems: {:?}",
+                            found_str, found_str_elems
+                        );
 
-                                for i in 2..found_str_elems.len() - 1 {
-                                    shell_command.arg(found_str_elems[i]);
+                        if found_str_elems.len() == 1 {
+                            /* A local variable, check if exist, else, check if it is env variable */
+                            let mut check_env = true;
+                            if let Some(vars) = variables {
+                                if let Some(value) = vars.get(found_str_elems[0]) {
+                                    /* Expand the variable */
+                                    debug!(
+                                        "Expanding variable {} with value: {}",
+                                        value.name, value.value
+                                    );
+                                    to = find_and_replace(
+                                        value.value.clone(),
+                                        rmake_re_var(),
+                                        variables,
+                                        target_name,
+                                        target_deps,
+                                    );
+                                    debug!("Expanded variable: {}", to);
+                                    check_env = false;
+                                } else {
+                                    warn!(
+                                        "Variable {} is not found in variables, checking env ..",
+                                        found_str_elems[0]
+                                    );
                                 }
+                            };
 
-                                to = String::from_utf8(
-                                    shell_command
-                                        .output()
-                                        .expect("Cannot execute command!")
-                                        .stdout,
-                                )
-                                .unwrap();
+                            if check_env {
+                                if let Ok(env_val) = std::env::var(found_str_elems[0]) {
+                                    to = env_val;
+                                    debug!("Found variable value in env: {}", to);
+                                }
                             }
-                            RMakeCoreCommand::Wildcard => {
-                                warn!("wildcard is not yet supported!")
+                        } else if found_str_elems.len() > 1 {
+                            debug!("Variable has more than element, cheking RMakeCoreCommands ..");
+
+                            /* This is an RMakeCoreCommand */
+                            match RMakeCoreCommand::from_str(found_str_elems[0]) {
+                                Ok(core_cmd) => match core_cmd {
+                                    RMakeCoreCommand::Shell => {
+                                        /* Run a Shell command and set (to) */
+                                        let mut shell_command = Command::new(found_str_elems[1]);
+
+                                        for i in 2..found_str_elems.len() - 1 {
+                                            shell_command.arg(found_str_elems[i]);
+                                        }
+
+                                        to = String::from_utf8(
+                                            shell_command
+                                                .output()
+                                                .expect("Cannot execute command!")
+                                                .stdout,
+                                        )
+                                        .unwrap();
+                                    }
+                                    RMakeCoreCommand::Wildcard => {
+                                        warn!("wildcard is not yet supported!")
+                                    }
+                                },
+                                Err(e) => {
+                                    RMakeError!("Variable error: {}", e);
+                                }
                             }
-                        },
-                        Err(e) => {
-                            RMakeError!("Variable error: {}", e);
                         }
                     }
                 }
